@@ -1,0 +1,203 @@
+﻿<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>상가업소 상호명 검색 지도</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; font-family: "Malgun Gothic", system-ui, sans-serif; background: #f4f6f9; color: #222; }
+
+  /* 왼쪽 사이드바 */
+  aside { width: 360px; flex-shrink: 0; height: 100%; overflow-y: auto; padding: 20px; background: #fff; border-right: 1px solid #e3e7ee; }
+  aside small { color: #2563eb; font-weight: 700; letter-spacing: .05em; }
+  aside h1 { margin: 4px 0 18px; font-size: 20px; line-height: 1.4; }
+  aside h1 b { color: #2563eb; }
+  .step { margin-bottom: 20px; }
+  .step h2 { margin: 0 0 8px; font-size: 14px; }
+
+  #drop { border: 2px dashed #9db4e8; border-radius: 10px; padding: 22px 12px; text-align: center; cursor: pointer; color: #456; font-size: 14px; transition: .15s; }
+  #drop.over { background: #eaf1ff; border-color: #2563eb; }
+  #drop small { display: block; margin-top: 6px; color: #889; font-weight: 400; letter-spacing: 0; font-size: 12px; }
+  #fileInfo { margin-top: 8px; font-size: 13px; color: #2563eb; word-break: break-all; }
+
+  .row { display: flex; gap: 6px; }
+  input[type=text] { flex: 1; min-width: 0; padding: 10px 12px; font-size: 14px; border: 1px solid #ccd; border-radius: 8px; }
+  button { padding: 10px 16px; font-size: 14px; border: 0; border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { background: #b8c2d6; cursor: not-allowed; }
+  button.sub { background: #fff; color: #2563eb; border: 1px solid #2563eb; flex: 1; }
+  button.sub:disabled { color: #aab; border-color: #ccd; background: #fff; }
+  #status { margin-top: 10px; font-size: 14px; line-height: 1.5; }
+  #status.err { color: #d33; }
+  #status.warn { color: #c77700; }
+  .save { display: flex; gap: 8px; }
+
+  /* 오른쪽 지도 */
+  #map { flex: 1; height: 100%; }
+
+  @media (max-width: 800px) {
+    body { flex-direction: column; }
+    aside { width: 100%; height: auto; max-height: 50%; border-right: 0; border-bottom: 1px solid #e3e7ee; }
+    #map { height: 50%; flex: none; width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<aside>
+  <small>상권정보 검색</small>
+  <h1>상가업소 데이터에서 <b>상호명</b>으로 찾아 지도에 표시</h1>
+
+  <div class="step">
+    <h2>1. 소상공인시장진흥공단 상가업소 CSV 파일 선택</h2>
+    <div id="drop">파일을 선택하거나 여기로 드래그하세요
+      <small>상호명 / 지점명 / 도로명 / 경도 / 위도 컬럼을 포함한 CSV</small>
+    </div>
+    <input type="file" id="file" accept=".csv,text/csv" hidden>
+    <div id="fileInfo"></div>
+  </div>
+
+  <div class="step">
+    <h2>2. 검색할 상호명 문자열 입력</h2>
+    <div class="row">
+      <input type="text" id="q" placeholder="예: 스타벅스, 김밥, 약국" disabled>
+      <button id="btn" disabled>검색</button>
+    </div>
+    <div id="status">CSV 파일을 먼저 선택하세요.</div>
+  </div>
+
+  <div class="step">
+    <h2>3. 검색 결과 저장</h2>
+    <div class="save">
+      <button class="sub" id="dlGeo" disabled>GeoJSON</button>
+      <button class="sub" id="dlCsv" disabled>CSV</button>
+    </div>
+  </div>
+</aside>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script>
+const REQUIRED = ["상호명","지점명","도로명","경도","위도"];
+let rows = [];
+let results = [];
+
+const $ = id => document.getElementById(id);
+const status = (msg, cls="") => { $("status").textContent = msg; $("status").className = cls; };
+
+// ---------- 지도 ----------
+const map = L.map("map", { preferCanvas: true }).setView([36.5, 127.8], 7);
+
+// 파일을 더블클릭해서 연 경우(file://)는 OSM이 차단하므로 Esri 베이스맵 사용
+if (location.protocol === "file:") {
+  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", {
+    maxZoom: 19, attribution: "Tiles &copy; Esri"
+  }).addTo(map);
+} else {
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "&copy; OpenStreetMap contributors"
+  }).addTo(map);
+}
+const layer = L.layerGroup().addTo(map);
+
+// ---------- 파일 입력 ----------
+const drop = $("drop"), fileInput = $("file");
+drop.onclick = () => fileInput.click();
+fileInput.onchange = e => e.target.files[0] && loadFile(e.target.files[0]);
+["dragover","dragenter"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", e => e.dataTransfer.files[0] && loadFile(e.dataTransfer.files[0]));
+
+async function loadFile(file) {
+  status("파일을 읽는 중...");
+  reset();
+  try {
+    const buf = await file.arrayBuffer();
+    let text;
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(buf); }
+    catch { text = new TextDecoder("euc-kr").decode(buf); }
+    text = text.replace(/^\uFEFF/, "");
+
+    const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+    const cols = (parsed.meta.fields || []).map(c => c.trim());
+    const missing = REQUIRED.filter(c => !cols.includes(c));
+    if (missing.length) {
+      status(`필수 컬럼이 없습니다: ${missing.join(", ")}`, "err");
+      return;
+    }
+    rows = parsed.data.map(r => { const o = {}; for (const k in r) o[k.trim()] = r[k]; return o; });
+    $("fileInfo").textContent = `${file.name} · ${rows.length.toLocaleString()}건 로드 완료`;
+    $("q").disabled = $("btn").disabled = false;
+    status("검색할 상호명을 입력하세요.");
+    $("q").focus();
+  } catch (err) {
+    status("파일을 읽는 중 오류가 발생했습니다: " + err.message, "err");
+  }
+}
+
+function reset() {
+  rows = []; results = []; layer.clearLayers();
+  $("fileInfo").textContent = "";
+  $("q").disabled = $("btn").disabled = $("dlGeo").disabled = $("dlCsv").disabled = true;
+}
+
+// ---------- 검색 ----------
+$("btn").onclick = search;
+$("q").addEventListener("keydown", e => e.key === "Enter" && search());
+
+function search() {
+  const kw = $("q").value.trim().toLowerCase();
+  if (!kw) { status("검색어를 입력하세요.", "warn"); return; }
+
+  results = rows.filter(r => {
+    const lon = parseFloat(r["경도"]), lat = parseFloat(r["위도"]);
+    return (r["상호명"] || "").toLowerCase().includes(kw) && isFinite(lon) && isFinite(lat);
+  });
+
+  layer.clearLayers();
+  $("dlGeo").disabled = $("dlCsv").disabled = results.length === 0;
+
+  if (results.length === 0) {
+    status(`'${$("q").value.trim()}'에 해당하는 상호명이 없습니다. 다른 검색어를 입력해 보세요.`, "warn");
+    return;
+  }
+
+  const bounds = [];
+  results.forEach(r => {
+    const ll = [parseFloat(r["위도"]), parseFloat(r["경도"])];
+    bounds.push(ll);
+    L.circleMarker(ll, { radius: 6, color: "#fff", weight: 1.5, fillColor: "#2563eb", fillOpacity: .9 })
+      .bindPopup(`<b>${esc(r["상호명"])}</b><br>지점명: ${esc(r["지점명"]) || "-"}<br>도로명: ${esc(r["도로명"]) || "-"}`)
+      .addTo(layer);
+  });
+  map.fitBounds(bounds, { padding: [40, 40], maxZoom: 17 });
+  status(`검색 결과: ${results.length.toLocaleString()}건`);
+}
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+
+// ---------- 저장 ----------
+function download(content, name, type) {
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
+}
+$("dlGeo").onclick = () => {
+  const geo = { type: "FeatureCollection", features: results.map(r => ({
+    type: "Feature",
+    geometry: { type: "Point", coordinates: [parseFloat(r["경도"]), parseFloat(r["위도"])] },
+    properties: r
+  })) };
+  download(JSON.stringify(geo), `검색결과_${$("q").value.trim()}.geojson`, "application/geo+json");
+};
+$("dlCsv").onclick = () => {
+  download("\uFEFF" + Papa.unparse(results), `검색결과_${$("q").value.trim()}.csv`, "text/csv;charset=utf-8");
+};
+</script>
+</body>
+</html>
